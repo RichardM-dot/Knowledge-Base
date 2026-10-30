@@ -1,0 +1,10 @@
+# macOS 系统元数据
+.DS_Store
+._*
+
+# 编译产物与调试符号（只保留 .c / .md 源文件）
+*.dSYM/
+*.o
+*.out
+数据结构与算法/circular_singly_linked_list_with_a_sentinel_node
+数据结构与算法/doubly_linked_circular_list_with_head_and_tail sentinels
