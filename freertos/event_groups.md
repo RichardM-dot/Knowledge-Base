@@ -1,8 +1,8 @@
 # event_groups.c 与 event_groups.h —— 事件组完全解读
 
-> 对应源文件（本地仓库 `~/workspace/freertos/`，FreeRTOS-Kernel V11.1.0+，行号以当前文件为准）：
-> - [event_groups.c](/Users/theo-richard/workspace/freertos/event_groups.c)（928 行）—— 事件组实现
-> - [include/event_groups.h](/Users/theo-richard/workspace/freertos/include/event_groups.h)（748 行）—— 类型与 API 声明
+> 对应源文件（本地仓库 `~/workspace/references/rtos/freertos/`，FreeRTOS-Kernel V11.1.0+，行号以当前文件为准）：
+> - [event_groups.c](/Users/theo-richard/workspace/references/rtos/freertos/event_groups.c)（928 行）—— 事件组实现
+> - [include/event_groups.h](/Users/theo-richard/workspace/references/rtos/freertos/include/event_groups.h)（748 行）—— 类型与 API 声明
 >
 > **前置阅读：** [list.md](list.md) → [tasks.md](tasks.md) → [queue.md](queue.md) → [timers.md](timers.md)
 > **配置项：** [freertosconfigh.md](freertosconfigh.md)
@@ -667,7 +667,116 @@ grep -n "BaseType_t xEventGroupSetBitsFromISR"  event_groups.c
 857:    BaseType_t xEventGroupSetBitsFromISR( EventGroupHandle_t xEventGroup,
 ```
 
-## 6.4 一句话总结
+## 6.4 注释级精读：无序事件表、`xItemValue` 复用与超时摘链
+
+事件组最容易读错的一点是：它虽然也把 `xEventListItem` 挂在 `List_t` 上，
+但这条链表**不是按优先级排序的事件表**，而是一条“无序事件链表”，
+`xItemValue` 被复用为等待条件。
+
+### 6.4.1 等待条件的编码
+
+`xEventGroupWaitBits()` 在需要阻塞时调用
+`vTaskPlaceOnUnorderedEventList()`（event_groups.c:418）：
+
+```c
+vTaskPlaceOnUnorderedEventList(
+    &( pxEventBits->xTasksWaitingForBits ),
+    ( uxBitsToWaitFor | uxControlBits ),
+    xTicksToWait );
+```
+
+`vTaskPlaceOnUnorderedEventList()` 在 tasks.c:5756-5786：
+
+```c
+listSET_LIST_ITEM_VALUE( &( pxCurrentTCB->xEventListItem ),
+                         xItemValue | taskEVENT_LIST_ITEM_VALUE_IN_USE );
+listINSERT_END( pxEventList, &( pxCurrentTCB->xEventListItem ) );
+prvAddCurrentTaskToDelayedList( xTicksToWait, pdTRUE );
+```
+
+与队列的 `vTaskPlaceOnEventList()` 对比：
+
+| 项 | 队列/信号量 | 事件组 |
+|---|---|---|
+| 插入函数 | `vListInsert()`（tasks.c:5748） | `listINSERT_END()`（tasks.c:5781） |
+| 排序 | 按 `xItemValue` 升序，等价优先级降序 | 不排序，按到达顺序追加 |
+| `xItemValue` | `configMAX_PRIORITIES - uxPriority` | `uxBitsToWaitFor`、控制位、`IN_USE` 位的按位或 |
+| 唤醒选择 | 表头即最高优先级 | 遍历全表，匹配条件的都唤醒 |
+
+`eventCLEAR_EVENTS_ON_EXIT_BIT`、`eventWAIT_FOR_ALL_BITS` 等控制位与用户等待位
+一起编码在 `xItemValue` 中，事件组在唤醒时再解码（event_groups.c:640 附近）。
+
+### 6.4.2 `taskEVENT_LIST_ITEM_VALUE_IN_USE` 的作用
+
+tasks.c:352-365：
+
+```c
+/*
+ * 事件链表项的 item 值通常用于保存其所属任务的优先级……
+ * 但该值偶尔会被借用。当它被用于其他目的时，
+ * 重要的是：即使任务优先级发生变化，也不能更新该值。
+ */
+#if ( configTICK_TYPE_WIDTH_IN_BITS == TICK_TYPE_WIDTH_32_BITS )
+    #define taskEVENT_LIST_ITEM_VALUE_IN_USE    ( ( uint32_t ) 0x80000000U )
+#endif
+```
+
+它是 tick 类型的最高位，作为“此 item 值已被借用”的标记位。
+
+`vTaskPrioritySet()` 在 tasks.c:3164-3167 检查这个位：
+
+```c
+if( ( listGET_LIST_ITEM_VALUE( &( pxTCB->xEventListItem ) )
+      & taskEVENT_LIST_ITEM_VALUE_IN_USE ) == 0U )
+{
+    listSET_LIST_ITEM_VALUE( &( pxTCB->xEventListItem ),
+                             configMAX_PRIORITIES - uxNewPriority );
+}
+```
+
+如果任务正在事件组上等待，`xItemValue` 保存的是等待条件，不是优先级；
+此时修改任务优先级不能覆盖它，否则事件组醒来后解码出的等待条件就错了。
+这就是“借用值”协议：借用者置位标记，释放者负责恢复原语义。
+
+### 6.4.3 置位时的遍历与摘链
+
+`xEventGroupSetBits()` 在 event_groups.c:575 之后遍历
+`xTasksWaitingForBits`：
+
+1. 对每个等待项，用 `prvTestWaitCondition()`（event_groups.c:816）
+   判断条件是否满足；
+2. 满足则调用 `vTaskRemoveFromUnorderedEventList()`
+   （tasks.c:5930；调用点 event_groups.c:655）：
+   - 把当前事件位或 `eventUNBLOCKED_DUE_TO_BIT_SET` 写入该链表项的
+     `xItemValue`，供任务恢复后读取；
+   - 从事件组链表摘除 `xEventListItem`；
+   - 从延时表摘除 `xStateListItem`；
+   - 加入就绪表。
+3. 遍历时必须先保存 `pxNext`（event_groups.c:659-662），因为当前项被摘除后
+   不能再用 `pxListItem->pxNext` 访问下一项。
+
+### 6.4.4 超时路径与事件组的关系
+
+如果任务在事件组上等待时超时：
+
+- `xTaskIncrementTick()` 在 tasks.c:5228-5231 检查
+  `xEventListItem.pxContainer != NULL`，发现它还挂在事件组链表上，就摘除它；
+- 任务被加入就绪表；
+- 之后 `xEventGroupSetBits()` 遍历时不会再看到这个任务，
+  因此不会重复唤醒，也不会把事件位写给一个已经因超时恢复的任务。
+
+这与队列的超时路径是同一套机制：**哪个唤醒源先到，就摘除另一个等待源**。
+事件组特殊之处只在于 `xItemValue` 的语义和链表无序，不在摘链协议。
+
+### 6.4.5 校验清单
+
+1. 当前等待的是队列/信号量（有序事件表）还是事件组（无序事件表）？
+2. `xItemValue` 当前是优先级编码，还是等待条件 + 控制位？
+3. 是否置了 `taskEVENT_LIST_ITEM_VALUE_IN_USE`？修改优先级时是否跳过覆盖？
+4. 遍历等待链表时，是否在摘除当前项前保存了下一项？
+5. 超时路径是否会把 `xEventListItem` 从事件组链表摘除？
+
+## 6.5 一句话总结
 
 - **事件组 = 一个位集合 + 一条无序等待链表**，两个核心字段，结构极简。
 - **等待条件编码进等待者的 `xItemValue`**（高 8 位控制、低 24 位位掩码）

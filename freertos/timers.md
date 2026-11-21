@@ -1,8 +1,8 @@
 # timers.c 与 timers.h —— 软件定时器完全解读
 
-> 对应源文件（本地仓库 `~/workspace/freertos/`，FreeRTOS-Kernel V11.1.0+，行号以当前文件为准）：
-> - [timers.c](/Users/theo-richard/workspace/freertos/timers.c)（1391 行）—— 定时器实现 + 定时器服务任务
-> - [include/timers.h](/Users/theo-richard/workspace/freertos/include/timers.h)（1231 行）—— `Timer_t` 声明、API 宏、命令 ID
+> 对应源文件（本地仓库 `~/workspace/references/rtos/freertos/`，FreeRTOS-Kernel V11.1.0+，行号以当前文件为准）：
+> - [timers.c](/Users/theo-richard/workspace/references/rtos/freertos/timers.c)（1391 行）—— 定时器实现 + 定时器服务任务
+> - [include/timers.h](/Users/theo-richard/workspace/references/rtos/freertos/include/timers.h)（1231 行）—— `Timer_t` 声明、API 宏、命令 ID
 >
 > **前置阅读：** [list.md](list.md)（链表）→ [tasks.md](tasks.md)（任务）→ [queue.md](queue.md)（队列）
 > **配置项：** [freertosconfigh.md](freertosconfigh.md)
@@ -631,7 +631,81 @@ grep -n "BaseType_t xTimerPendFunctionCall("    timers.c
 1311:BaseType_t xTimerPendFunctionCall(
 ```
 
-## 6.4 一句话总结
+## 6.4 注释级精读：tick、定时器链表与服务任务的分工
+
+软件定时器容易被误解为“tick 中断里直接执行回调”。实际分工是：
+
+```text
+SysTick 中断
+  → xTaskIncrementTick()          推进 xTickCount，处理任务延时到期
+  → 定时器服务任务被唤醒（如果它的受限等待到期或有命令）
+  → prvTimerTask()                取出到期定时器，调用回调
+```
+
+### 6.4.1 tick 中断不处理定时器链表
+
+- `xTaskIncrementTick()`（tasks.c:5139）只维护 `xTickCount`、任务延时表和
+  就绪表；它不遍历 `pxCurrentTimerList`，也不调用定时器回调。
+- 定时器链表由 `prvTimerTask()`（timers.c:778）在任务上下文处理：
+  - `prvProcessExpiredTimer()`（timers.c:745）处理到期项；
+  - `vQueueWaitForMessageRestricted()`（timers.c:852）让服务任务睡到
+    “下一个到期时刻”，同时保持对命令队列的响应；
+  - `xTaskGetTickCount()`（timers.c:907）读取当前 tick，作为时间基准。
+
+因此定时器回调的执行上下文是**定时器服务任务**，不是 SysTick ISR。
+回调里可以调用任务级 API，但不能阻塞、不能执行过长，否则会延迟其他定时器。
+
+### 6.4.2 `xPendedTicks` 与调度器挂起
+
+调度器挂起时（`uxSchedulerSuspended != 0`）：
+
+- `xTaskIncrementTick()` 走 tasks.c:5374-5386 的慢路径：`xPendedTicks++`，
+  不推进 `xTickCount`，不处理任务延时；
+- 定时器服务任务也无法运行（调度器不切换）；
+- `xTaskResumeAll()` 在 tasks.c:4443-4458 循环调用 `xTaskIncrementTick()`
+  补算 pended ticks，tasks.c:4460 清零；
+- 补算完成后，定时器服务任务才会按其唤醒条件恢复，处理到期定时器。
+
+这意味着：**调度器挂起期间，软件定时器的回调不会按时执行**；
+恢复后会集中补算 tick，但回调的执行时间会推迟到服务任务重新运行。
+
+### 6.4.3 tick hook 与定时器回调的区别
+
+| 项 | tick hook | 定时器回调 |
+|---|---|---|
+| 注册 | `configUSE_TICK_HOOK=1` + `vApplicationTickHook()` | `xTimerCreate()` + 回调函数 |
+| 上下文 | SysTick ISR | 定时器服务任务 |
+| 频率 | 每个 tick | 按定时器周期/单次 |
+| 可阻塞 | 否 | 否（会阻塞服务任务） |
+| 可调用 API | 只能 `FromISR` 且受中断优先级约束 | 任务级 API，但不能阻塞 |
+| 实现位置 | 应用 | 应用 |
+
+tasks.c:5316-5318 的快路径条件 `xPendedTicks == 0` 保证补算期间不重复调用
+tick hook；tasks.c:5381-5385 的慢路径在调度器挂起时仍每个 tick 调用 hook。
+这与定时器回调无关：hook 在 ISR 中执行，定时器回调在服务任务中执行。
+
+### 6.4.4 双延时表与定时器链表的同构
+
+- 任务延时表：`pxDelayedTaskList` / `pxOverflowDelayedTaskList`，
+  tick 回绕时交换（tasks.c:315-327）。
+- 定时器链表：`pxCurrentTimerList` / `pxOverflowTimerList`，
+  由定时器服务任务在 `prvSampleTimeNow()`（timers.c:902-918）采样 tick；
+  若 `xTimeNow < xLastTime`，说明 tick 已回绕，调用
+  `prvSwitchTimerLists()`（timers.c:1131）交换两张表。
+- 两者都按绝对到期时刻排序，都用“表头即最早到期”做 O(1) 检查；
+  区别是任务延时由 tick 中断直接摘链，定时器由服务任务摘链。
+  定时器服务任务的回绕检测是独立的，不依赖 `xTaskIncrementTick()` 的
+  `taskSWITCH_DELAYED_LISTS()`（tasks.c:5172）。
+
+### 6.4.5 校验清单
+
+1. 这个时间值来自 `xTickCount` 还是独立硬件计数器？
+2. 回调在 ISR 还是任务上下文？
+3. 调度器挂起期间，定时器回调是否被推迟？
+4. `xPendedTicks` 补算期间，tick hook 是否会重复调用？
+5. 双链表交换是否发生在正确的 tick 回绕点？
+
+## 6.5 一句话总结
 
 - **一个任务（`prvTimerTask`）+ 一条按到期时刻排序的链表 + 一条命令队列**，就是软件定时器的全部。
 - **所有 API 都只是发命令**（timers.h 里 6 个任务级 + 4 个 ISR 级宏），

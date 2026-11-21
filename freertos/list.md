@@ -1,13 +1,13 @@
 # list.c 与 list.h —— FreeRTOS 内核链表完全解读
 
-> 对应源文件（本地仓库 `~/workspace/freertos/`，FreeRTOS-Kernel V11.1.0+，行号以当前文件为准）：
-> - [list.c](/Users/theo-richard/workspace/freertos/list.c)（529 行，含大量中文注释）—— 链表操作实现，全文件只有 **5 个函数**
-> - [include/list.h](/Users/theo-richard/workspace/freertos/include/list.h)（501 行）—— 3 个数据类型 + **17 个访问宏** + 5 个函数声明
+> 对应源文件（本地仓库 `~/workspace/references/rtos/freertos/`，FreeRTOS-Kernel V11.1.0+，行号以当前文件为准）：
+> - [list.c](/Users/theo-richard/workspace/references/rtos/freertos/list.c)（568 行，含大量中文注释）—— 链表操作实现，全文件只有 **5 个函数**
+> - [include/list.h](/Users/theo-richard/workspace/references/rtos/freertos/include/list.h)（501 行）—— 3 个数据类型 + **17 个访问宏** + 5 个函数声明
 >
 > **后续阅读：** [tasks.md](tasks.md)（调度器如何用这些链表）、[queue.md](queue.md)（队列/信号量）
 > **配置项：** [freertosconfigh.md](freertosconfigh.md)
 >
-> ⚠️ **行号提示**：本文行号已按当前 `list.c`（529 行，含大量中文注释）与 `list.h`（501 行）逐条校对。
+> ⚠️ **行号提示**：本文行号已按当前 `list.c`（568 行，含大量中文注释）与 `list.h`（501 行）逐条校对。
 > 若源码被改动，用 7.3 的自查命令重新核对。
 
 ---
@@ -70,7 +70,7 @@ pxContainer  // 链表项 → 所属链表（"我此刻挂在谁身上"，NULL =
 这两个指针让所有反查变成 O(1)：
 
 - 拿到链表项就能立刻找到宿主任务（`listGET_OWNER_OF_NEXT_ENTRY` 靠它挑选下一个任务）；
-- 删除时**只需传项、不需传表**（`uxListRemove` 靠 `pxContainer` 反查，list.c:419）。
+- 删除时**只需传项、不需传表**（`uxListRemove` 靠 `pxContainer` 反查，list.c:458）。
 
 ### 概念 4：三种插入方式对应三种语义
 
@@ -114,22 +114,22 @@ pxContainer  // 链表项 → 所属链表（"我此刻挂在谁身上"，NULL =
                           │
                           ▼
 ┌─ 第 2 站：两个初始化函数 ────────────────────────────────────────
-│  vListInitialise      list.c:89-148   （初始化链表本身）
-│  vListInitialiseItem  list.c:151-179  （初始化链表项）
+│  vListInitialise      list.c:89-149   （初始化链表本身）
+│  vListInitialiseItem  list.c:152-218  （初始化链表项）
 │  目标：明白"空链表长什么样"；记住 pxContainer = NULL 这条约定
 └──────────────────────────────────────────────────────────────────
                           │
                           ▼
 ┌─ 第 3 站：两个插入（对比着读，重点）─────────────────────────────
-│  vListInsertEnd  list.c:182-227  O(1)，不排序，插在 pxIndex 前一格
-│  vListInsert     list.c:230-399  O(n)，按 xItemValue 升序
+│  vListInsertEnd  list.c:221-266  O(1)，不排序，插在 pxIndex 前一格
+│  vListInsert     list.c:269-438  O(n)，按 xItemValue 升序
 │  目标：想通"为什么就绪表用 InsertEnd、延时表用 Insert"；
-│        以及 portMAX_DELAY 为什么必须特判（list.c:266）
+│        以及 portMAX_DELAY 为什么必须特判（list.c:305）
 └──────────────────────────────────────────────────────────────────
                           │
                           ▼
 ┌─ 第 4 站：删除 ──────────────────────────────────────────────────
-│  uxListRemove  list.c:404-527  O(1)，只传项不传表
+│  uxListRemove  list.c:443-566  O(1)，只传项不传表
 │  目标：明白 pxContainer 反查的原理，以及"返回值 0"的妙用
 └──────────────────────────────────────────────────────────────────
                           │
@@ -214,8 +214,8 @@ ListItem_t（list.h:133）—— 嵌在宿主体内，不单独分配
 | 挂在哪 | 值含义 | 谁写 | 出处 |
 |---|---|---|---|
 | 就绪表 | **不使用** | — | — |
-| 延时表 / 溢出表 | 绝对唤醒时刻 `xTickCount + 延时` | `prvAddCurrentTaskToDelayedList` | tasks.c:9056 |
-| 事件表 | `configMAX_PRIORITIES - uxPriority` | 任务创建时写入一次 | tasks.c:1876 区段 |
+| 延时表 / 溢出表 | 绝对唤醒时刻 `xTickCount + 延时` | `prvAddCurrentTaskToDelayedList` | tasks.c:9157-9160 |
+| 队列/信号量事件表 | `configMAX_PRIORITIES - uxPriority` | 任务创建时写入一次 | tasks.c:2067 |
 | 定时器活动表 | 绝对到期时刻 | `xTimerStart` / `xTimerReset` | timers.c |
 
 **为什么事件表要"取反"？** 因为链表按升序，而优先级是"数字大=优先级高"。
@@ -235,10 +235,10 @@ ListItem_t（list.h:133）—— 嵌在宿主体内，不单独分配
 >
 > 同理：`listTEST_LIST_INTEGRITY` / `listTEST_LIST_ITEM_INTEGRITY` 只在
 > `configUSE_LIST_DATA_INTEGRITY_CHECK_BYTES=1` 时有实体（list.h:124-125）；
-> `mtCOVERAGE_TEST_DELAY()` / `mtCOVERAGE_TEST_MARKER()`（list.c:208、259、268）
+> `mtCOVERAGE_TEST_DELAY()` / `mtCOVERAGE_TEST_MARKER()`（list.c:247、259、268）
 > 是判定覆盖率测试的占位宏，默认也为空。
 
-## 3.1 `vListInitialise`（实现 list.c:89-148，声明 list.h:433）
+## 3.1 `vListInitialise`（实现 list.c:89-149，声明 list.h:433）
 
 **作用：把一块 `List_t` 内存初始化成合法空链表。必须在使用前调用。**
 
@@ -250,7 +250,7 @@ ListItem_t（list.h:133）—— 嵌在宿主体内，不单独分配
 | list.c:116 | `pxNext = pxPrevious = &xListEnd` | **自指 → 空环**。这也是另一种判空方式 |
 | list.c:126-132 | `#if ( configUSE_MINI_LIST_ITEM == 0 )` | 哨兵是完整项时补齐 `pvOwner` / `pxContainer` |
 | list.c:137 | `uxNumberOfItems = 0` | 计数清零 |
-| list.c:144-145 | `listSET_LIST_INTEGRITY_CHECK_1/2_VALUE` | 链表头尾写魔数（若开启校验） |
+| list.c:145-146 | `listSET_LIST_INTEGRITY_CHECK_1/2_VALUE` | 链表头尾写魔数（若开启校验） |
 
 **空链表长这样：**
 
@@ -265,29 +265,29 @@ ListItem_t（list.h:133）—— 嵌在宿主体内，不单独分配
 
 **调用者：** 定时器服务启动 `vListInitialise( &xActiveTimerList1 )`（timers.c:1166）；
 队列/事件组创建时初始化"等待发送/接收"表；
-调度器第一次建任务时 `prvInitialiseTaskLists`（tasks.c:6424）初始化全部调度链表。
+调度器第一次建任务时 `prvInitialiseTaskLists`（tasks.c:6528）初始化全部调度链表。
 
-## 3.2 `vListInitialiseItem`（实现 list.c:151-179，声明 list.h:444）
+## 3.2 `vListInitialiseItem`（实现 list.c:152-218，声明 list.h:444）
 
 **作用：把一个链表项标记为"不属于任何链表"。必须在使用前调用。**
 
 整个函数只有 1 行实质代码：
 
 ```c
-pxItem->pxContainer = NULL;    // list.c:161
+pxItem->pxContainer = NULL;    // list.c:163
 ```
 
 **为什么这一行这么重要？** 它是三条机制的根基：
 
-1. `uxListRemove(pxItem)` 靠 `pxContainer` 反查所属链表（list.c:419）——若为 NULL 就会空指针解引用；
+1. `uxListRemove(pxItem)` 靠 `pxContainer` 反查所属链表（list.c:458）——若为 NULL 就会空指针解引用；
 2. `listIS_CONTAINED_WITHIN(pxList, pxItem)`（list.h:407）靠它判断"这个项挂在这条链上吗"；
 3. `listLIST_ITEM_CONTAINER(pxItem)`（list.h:415）——`xTaskIncrementTick` 用它判断
-   "任务从延时表醒来时，另一个链表项是否还挂在事件表上"（tasks.c:5123）。
+   "任务从延时表醒来时，另一个链表项是否还挂在事件表上"（tasks.c:5228）。
 
 **调用者：** `xTaskCreate` 初始化 TCB 的 `xStateListItem` 与 `xEventListItem`；
 `xTimerCreate` 初始化 `xTimerListItem`。
 
-## 3.3 `vListInsertEnd`（实现 list.c:182-227，声明 list.h:478）
+## 3.3 `vListInsertEnd`（实现 list.c:221-266，声明 list.h:478）
 
 **作用：不排序，把新项插到 `pxIndex` 的"前一格"**（即 `pxIndex->pxPrevious` 与 `pxIndex` 之间）。
 效果 = 它将成为 `listGET_OWNER_OF_NEXT_ENTRY()` **最后**轮到的项。
@@ -316,29 +316,29 @@ pxItem->pxContainer = NULL;    // list.c:161
 
 | 行号 | 代码 | 含义 |
 |---|---|---|
-| list.c:188 | `pxIndex = pxList->pxIndex` | 缓存到局部变量（后面用 4 次） |
-| list.c:204-205 | 设置新项的 next / previous | 前两步：新项先指好邻居 |
-| list.c:216-217 | 邻居反指新项 | 后两步：邻居认新项 |
-| list.c:220 | `pxContainer = pxList` | 记账：我现在在这条链上 |
-| list.c:224 | `uxNumberOfItems + 1` | 计数 |
+| list.c:227 | `pxIndex = pxList->pxIndex` | 缓存到局部变量（后面用 4 次） |
+| list.c:243-244 | 设置新项的 next / previous | 前两步：新项先指好邻居 |
+| list.c:255-256 | 邻居反指新项 | 后两步：邻居认新项 |
+| list.c:259 | `pxContainer = pxList` | 记账：我现在在这条链上 |
+| list.c:263 | `uxNumberOfItems + 1` | 计数 |
 
 **调用者：** 就绪表插入宏 `prvAddTaskToReadyList`（tasks.c:335，用内联版 `listINSERT_END`）；
-无限期阻塞进挂起表（tasks.c:9045）。
+无限期阻塞进挂起表（tasks.c:9149）。
 
-## 3.4 `vListInsert`（实现 list.c:230-399，声明 list.h:457）
+## 3.4 `vListInsert`（实现 list.c:269-438，声明 list.h:457）
 
 **作用：按 `xItemValue` 升序插入。5 个函数里唯一可能 O(n) 的。**
 
 | 行号 | 代码 | 含义 |
 |---|---|---|
-| list.c:245 | `xValueOfInsertion = pxNewListItem->xItemValue` | 先取出排序键 |
-| list.c:266-289 | `if( xValueOfInsertion == portMAX_DELAY )` → 迭代器直接定位到最后一项 | **必须特判**，原因见下 |
-| list.c:342-348 | `for(...; pxIterator->pxNext->xItemValue <= xValueOfInsertion; ...)` | 从哨兵沿环走，直到"下一个值 > 新值"停下 |
-| list.c:373-382 | 四指针缝合 | 把新项接到迭代器之后 |
-| list.c:388 | `pxContainer = pxList` | 记账 |
-| list.c:396 | `uxNumberOfItems + 1` | 计数 |
+| list.c:284 | `xValueOfInsertion = pxNewListItem->xItemValue` | 先取出排序键 |
+| list.c:305-328 | `if( xValueOfInsertion == portMAX_DELAY )` → 迭代器直接定位到最后一项 | **必须特判**，原因见下 |
+| list.c:381-387 | `for(...; pxIterator->pxNext->xItemValue <= xValueOfInsertion; ...)` | 从哨兵沿环走，直到"下一个值 > 新值"停下 |
+| list.c:412-421 | 四指针缝合 | 把新项接到迭代器之后 |
+| list.c:427 | `pxContainer = pxList` | 记账 |
+| list.c:435 | `uxNumberOfItems + 1` | 计数 |
 
-### 为什么 `portMAX_DELAY` 必须特判（list.c:266）
+### 为什么 `portMAX_DELAY` 必须特判（list.c:305）
 
 循环条件是 `pxIterator->pxNext->xItemValue <= 新值`：
 
@@ -353,7 +353,7 @@ pxItem->pxContainer = NULL;    // list.c:161
 > 2. **哨兵值最大保证了它是唯一的"末尾标记"**，这正是 `vListInitialise` 把哨兵值设为
 >    `portMAX_DELAY` 的真正原因（list.c:109）。
 
-### 官方崩溃排查清单（list.c:293-307）
+### 官方崩溃排查清单（list.c:332-346）
 
 源码在这里留了一大段注释。应用若在此处死循环/崩溃，按顺序查：
 
@@ -365,10 +365,10 @@ pxItem->pxContainer = NULL;    // list.c:161
 
 这段注释出现在这里不是随意的：链表是最先被破坏的数据结构，任何内存越界都先在这里露出症状。
 
-**调用者：** 延时表/溢出表（tasks.c:9064、9072，按唤醒时刻）；
-事件表 `vTaskPlaceOnEventList`（tasks.c:5644，按优先级）；定时器活动表（timers.c，按到期时刻）。
+**调用者：** 延时表/溢出表（tasks.c:9168、9176，按唤醒时刻）；
+事件表 `vTaskPlaceOnEventList`（tasks.c:5748，按优先级）；定时器活动表（timers.c，按到期时刻）。
 
-## 3.5 `uxListRemove`（实现 list.c:404-527，声明 list.h:493）
+## 3.5 `uxListRemove`（实现 list.c:443-566，声明 list.h:493）
 
 **作用：把项从所在链表摘下，O(1)，返回剩余项数。参数是"项"不是"表"。**
 
@@ -377,13 +377,13 @@ pxItem->pxContainer = NULL;    // list.c:161
 ```text
 删除前：   哨兵 ⇄ A ⇄ B ⇄ C        pxIndex 停在 B
 
-步骤 1（list.c:452-453）：邻居互相指过去
+步骤 1（list.c:491-492）：邻居互相指过去
         B.pxNext->pxPrevious = B.pxPrevious   // C.prev = A
         B.pxPrevious->pxNext = B.pxNext       // A.next = C
-步骤 2（list.c:480-487）：若 pxIndex 正指向 B，拨回前一项
+步骤 2（list.c:519-526）：若 pxIndex 正指向 B，拨回前一项
         pxIndex = B.pxPrevious                // = A
-步骤 3（list.c:505）：B.pxContainer = NULL
-步骤 4（list.c:513）：uxNumberOfItems - 1
+步骤 3（list.c:544）：B.pxContainer = NULL
+步骤 4（list.c:552）：uxNumberOfItems - 1
 
 删除后：   哨兵 ⇄ A ⇄ C            pxIndex 指向 A（仍有效）
            B 游离：pxContainer 已清空，但 pxNext / pxPrevious 仍是旧值
@@ -391,15 +391,15 @@ pxItem->pxContainer = NULL;    // list.c:161
 
 | 行号 | 代码 | 含义 |
 |---|---|---|
-| list.c:419 | `pxList = pxItemToRemove->pxContainer` | **反查所属链表**——参数只需传项的原因 |
-| list.c:452-453 | 邻居互指 | 标准双向链表 O(1) 摘除 |
-| list.c:480-487 | `if( pxList->pxIndex == pxItemToRemove )` → 拨回前一项 | 保证游标永远指向有效项 |
-| list.c:505 | `pxContainer = NULL` | 恢复"游离"状态（与 3.2 的约定闭环） |
-| list.c:513-526 | 计数 -1，返回剩余项数 | |
+| list.c:458 | `pxList = pxItemToRemove->pxContainer` | **反查所属链表**——参数只需传项的原因 |
+| list.c:491-492 | 邻居互指 | 标准双向链表 O(1) 摘除 |
+| list.c:519-526 | `if( pxList->pxIndex == pxItemToRemove )` → 拨回前一项 | 保证游标永远指向有效项 |
+| list.c:544 | `pxContainer = NULL` | 恢复"游离"状态（与 3.2 的约定闭环） |
+| list.c:552-565 | 计数 -1，返回剩余项数 | |
 
 ### 返回值的巧妙用法
 
-`prvAddCurrentTaskToDelayedList`（tasks.c:9002）这样用：
+`prvAddCurrentTaskToDelayedList`（tasks.c:9106）这样用：
 
 ```c
 if( uxListRemove( &( pxCurrentTCB->xStateListItem ) ) == ( UBaseType_t ) 0 )
@@ -409,9 +409,9 @@ if( uxListRemove( &( pxCurrentTCB->xStateListItem ) ) == ( UBaseType_t ) 0 )
 ```
 
 **一次删除顺带完成了优先级位图维护**：返回 0 说明"该优先级的就绪表空了"，
-此时才有必要清位图对应位（tasks.c:9024-9030）。省掉一次独立的判空查询。
+此时才有必要清位图对应位（tasks.c:9128-9135）。省掉一次独立的判空查询。
 
-**调用者：** tasks.c:9024 等内核路径；更热的路径（每 tick 解除阻塞，tasks.c:5119）
+**调用者：** tasks.c:9128 等内核路径；更热的路径（每 tick 解除阻塞，tasks.c:5223）
 用内联版宏 `listREMOVE_ITEM`（list.h:319），逻辑一样，省一次函数调用。
 
 ---
@@ -427,17 +427,17 @@ if( uxListRemove( &( pxCurrentTCB->xStateListItem ) ) == ( UBaseType_t ) 0 )
 |---|---:|---|---|
 | `listSET_LIST_ITEM_OWNER(pxItem, pxOwner)` | 189 | 写 pvOwner | 创建任务时把 TCB 登记到链表项 |
 | `listGET_LIST_ITEM_OWNER(pxItem)` | 198 | 读 pvOwner | 由项反查宿主 |
-| `listSET_LIST_ITEM_VALUE(pxItem, xValue)` | 207 | 写排序键 | 阻塞前写唤醒时刻（tasks.c:9056） |
-| `listGET_LIST_ITEM_VALUE(pxItem)` | 216 | 读排序键 | tick 里比对到期时刻（tasks.c:5102） |
-| `listGET_ITEM_VALUE_OF_HEAD_ENTRY(pxList)` | 224 | 读表头项的值 | O(1) 偷看最早到期时刻（tasks.c:6904） |
+| `listSET_LIST_ITEM_VALUE(pxItem, xValue)` | 207 | 写排序键 | 阻塞前写唤醒时刻（tasks.c:9160） |
+| `listGET_LIST_ITEM_VALUE(pxItem)` | 216 | 读排序键 | tick 里比对到期时刻（tasks.c:5206） |
+| `listGET_ITEM_VALUE_OF_HEAD_ENTRY(pxList)` | 224 | 读表头项的值 | O(1) 偷看最早到期时刻（tasks.c:7008） |
 | `listGET_HEAD_ENTRY(pxList)` | 232 | 取表头项 | 手工遍历起点 |
 | `listGET_NEXT(pxItem)` | 240 | 取下一个项 | 手工遍历 |
 | `listGET_END_MARKER(pxList)` | 248 | 取哨兵 | 手工遍历终止条件 |
-| `listLIST_IS_EMPTY(pxList)` | 257 | O(1) 判空 | `xTaskResumeAll` 搬表前判空（tasks.c:4279） |
+| `listLIST_IS_EMPTY(pxList)` | 257 | O(1) 判空 | `xTaskResumeAll` 搬表前判空（tasks.c:4384） |
 | `listCURRENT_LIST_LENGTH(pxList)` | 262 | O(1) 读项数 | 优化版任务选择时断言非空 |
-| `listGET_OWNER_OF_HEAD_ENTRY(pxList)` | 396 | 取表头项的宿主 | 取最早到期任务，**tick 热路径**（tasks.c:5101） |
+| `listGET_OWNER_OF_HEAD_ENTRY(pxList)` | 396 | 取表头项的宿主 | 取最早到期任务，**tick 热路径**（tasks.c:5205） |
 | `listIS_CONTAINED_WITHIN(pxList, pxItem)` | 407 | 判断项是否挂着 | 状态查询 |
-| `listLIST_ITEM_CONTAINER(pxItem)` | 415 | 读 pxContainer | 判断"还挂在事件表吗"（tasks.c:5123） |
+| `listLIST_ITEM_CONTAINER(pxItem)` | 415 | 读 pxContainer | 判断"还挂在事件表吗"（tasks.c:5228） |
 | `listLIST_IS_INITIALISED(pxList)` | 422 | 粗略判断是否初始化过 | 防"未初始化就使用"（哨兵值是否 = portMAX_DELAY） |
 
 ## 4.2 带逻辑的"内联函数"宏（3 个）
@@ -466,7 +466,7 @@ if( pxIndex == &xListEnd )                                        // 撞到哨�
 效果：A → B → C → A → B → C ... 无限轮转 = 时间片轮转
 ```
 
-`vTaskSwitchContext` 每次切换都调用它（tasks.c:253 / 290）。
+`vTaskSwitchContext` 每次切换都调用它（tasks.c:254 / 291）。
 
 **注意 SMP 分支（list.h:295-302）：** 多核下这个宏**根本不定义**——
 SMP 调度器不使用 `pxIndex` 轮转，`pxIndex` 应始终指向 `xListEnd`。
@@ -475,7 +475,7 @@ SMP 调度器不使用 `pxIndex` 轮转，`pxIndex` 应始终指向 `xListEnd`�
 
 逻辑与 `uxListRemove` 完全相同：邻居互指 → 修游标 → `pxContainer=NULL` → 计数 -1。
 区别只有两点：少了返回值、没有完整性校验。
-专为 `xTaskIncrementTick` 这类每 tick 都跑的热路径省函数调用（tasks.c:5119、5126、5753、5757）。
+专为 `xTaskIncrementTick` 这类每 tick 都跑的热路径省函数调用（tasks.c:5223、5230、5857、5861）。
 
 ### `listINSERT_END(pxList, pxNewListItem)`（list.h:358-381）—— `vListInsertEnd` 的内联版
 
@@ -495,12 +495,12 @@ SMP 调度器不使用 `pxIndex` 轮转，`pxIndex` 应始终指向 `xListEnd`�
 
 | 实例 | 定义处 | 装什么 | 插入方式 |
 |---|---|---|---|
-| `pxReadyTasksLists[configMAX_PRIORITIES]` | tasks.c:530 | 每个优先级一条就绪表 | `listINSERT_END`（不排序） |
-| `xDelayedTaskList1` / `xDelayedTaskList2` | tasks.c:531-532 | 延时任务；两表轮换防 tick 回绕 | `vListInsert`（按唤醒时刻） |
-| `pxDelayedTaskList` / `pxOverflowDelayedTaskList` | tasks.c:533-534 | 指向上面两张表的"当前/溢出"指针 | — |
-| `xPendingReadyList` | tasks.c:535 | 调度器挂起期间被唤醒的任务，恢复时统一搬回 | `vListInsertEnd` |
-| `xTasksWaitingTermination` | tasks.c:539 | 已删除、等空闲任务回收内存的 TCB | `vListInsertEnd` |
-| `xSuspendedTaskList` | tasks.c:546 | 挂起的任务；**无限期阻塞也进这里** | `listINSERT_END`（tasks.c:9045） |
+| `pxReadyTasksLists[configMAX_PRIORITIES]` | tasks.c:531 | 每个优先级一条就绪表 | `listINSERT_END`（不排序） |
+| `xDelayedTaskList1` / `xDelayedTaskList2` | tasks.c:532-533 | 延时任务；两表轮换防 tick 回绕 | `vListInsert`（按唤醒时刻） |
+| `pxDelayedTaskList` / `pxOverflowDelayedTaskList` | tasks.c:534-535 | 指向上面两张表的"当前/溢出"指针 | — |
+| `xPendingReadyList` | tasks.c:536 | 调度器挂起期间被唤醒的任务，恢复时统一搬回 | `vListInsertEnd` |
+| `xTasksWaitingTermination` | tasks.c:540 | 已删除、等空闲任务回收内存的 TCB | `vListInsertEnd` |
+| `xSuspendedTaskList` | tasks.c:547 | 挂起的任务；**无限期阻塞也进这里** | `listINSERT_END`（tasks.c:9149） |
 | `Queue_t.xTasksWaitingToSend` | queue.c:126 | 等发送而阻塞的任务（挂在队列自己身上） | `vListInsert`（按优先级） |
 | `Queue_t.xTasksWaitingToReceive` | queue.c:127 | 等接收而阻塞的任务 | `vListInsert`（按优先级） |
 | `EventGroup_t.xTasksWaitingForBits` | event_groups.c:69 | 等事件位的任务 | `vListInsert`（按优先级） |
@@ -613,7 +613,7 @@ vTaskDelete
 
 ★ 条件是 <=（不是 <）：若已有 C(25)，新 N 会排在 C 之后 → 稳定插入
 ★ 若新值 = portMAX_DELAY，哨兵值（也是 portMAX_DELAY）会让条件恒成立
-  → 必须在 list.c:266 特判，否则死循环
+  → 必须在 list.c:305 特判，否则死循环
 ```
 
 ## 6.4 图 4：InsertEnd 插入位置 vs 轮转取任务
@@ -645,7 +645,7 @@ vTaskDelete
 
 情形 B：删除游标项
    哨兵 ⇄ A ⇄ B ⇄ C，pxIndex → B，删 B
-   → 邻居互指；pxIndex 拨回 B.prev = A（list.c:482）
+   → 邻居互指；pxIndex 拨回 B.prev = A（list.c:521）
    结果：哨兵 ⇄ A ⇄ C，pxIndex → A（仍有效）
 
 情形 C：删除链表最后一项
@@ -668,8 +668,8 @@ vTaskDelete
         └──────────────────────────────┘
 
 两条唤醒路径，谁先到都能叫醒它，且都会顺手摘掉另一条链上的项：
-  ① 数据到达 → xTaskRemoveFromEventList 摘事件项 + 摘状态项（tasks.c:5753/5757）
-  ② 超时到达 → xTaskIncrementTick      摘状态项 + 摘事件项（tasks.c:5119/5126）
+  ① 数据到达 → xTaskRemoveFromEventList 摘事件项 + 摘状态项（tasks.c:5857/5861）
+  ② 超时到达 → xTaskIncrementTick      摘状态项 + 摘事件项（tasks.c:5223/5230）
 
 ★ 这正是 pvContainer 存在的意义：不查表就知道"我还挂在哪、
   以及另一个项还有没有挂在别处"
@@ -747,8 +747,8 @@ stateDiagram-v2
 | 链表根字段数 | 3（+ 2 个可选校验字段） | list.h:173-180 |
 | 哨兵 `xItemValue` | `portMAX_DELAY` | list.c:109 |
 | 空链表判据 | `uxNumberOfItems == 0` 或 哨兵自指 | list.h:257 / list.c:116 |
-| 插入复杂度 | InsertEnd = O(1)；Insert = O(n) | list.c:182 / 174 |
-| 删除复杂度 | O(1) | list.c:404 |
+| 插入复杂度 | InsertEnd = O(1)；Insert = O(n) | list.c:221 / 174 |
+| 删除复杂度 | O(1) | list.c:443 |
 | 公开宏数量 | 17 | list.h |
 
 ## 7.3 行号自查命令
@@ -759,17 +759,114 @@ stateDiagram-v2
 grep -nE "^void vListInitialise\(|^void vListInitialiseItem\(|^void vListInsertEnd\(|^void vListInsert\(|^UBaseType_t uxListRemove\(" list.c
 ```
 
-期望输出（当前 list.c 共 529 行）：
+期望输出（当前 list.c 共 568 行）：
 
 ```text
-89:void vListInitialise( List_t * const pxList )
+89:void vListInitialise( List_t * const pxList ) // 把一个 List_t 链表控制块初始化成“合法空链表”
 151:void vListInitialiseItem( ListItem_t * const pxItem )
 182:void vListInsertEnd( List_t * const pxList, ListItem_t * const pxNewListItem )
 230:void vListInsert( List_t * const pxList,ListItem_t * const pxNewListItem )
 404:UBaseType_t uxListRemove( ListItem_t * const pxItemToRemove )
 ```
 
-## 7.4 一句话总结
+## 7.4 注释级精读：`xItemValue` 的两种语义与 `pxContainer` 的成员资格
+
+这一节把 list.h 的宏与 tasks.c 的实际调用点对应起来，解释几个容易误读的注释。
+
+### 7.4.1 同一个 `xItemValue`，在两条链表上语义不同
+
+| 链表 | 使用哪个链表项 | `xItemValue` 的含义 | 写入位置 |
+|---|---|---|---|
+| 延时表 | `xStateListItem` | 绝对唤醒 tick（`xTickCount + 延时`） | tasks.c:9157-9160 |
+| 队列/信号量的有序事件表 | `xEventListItem` | 优先级编码 `configMAX_PRIORITIES - uxPriority` | tasks.c:2067、3166、7142、7275、7379 |
+| 事件组的无序事件表 | `xEventListItem` | 等待条件位掩码 + 控制位，并置 `taskEVENT_LIST_ITEM_VALUE_IN_USE` | tasks.c:5774；event_groups.c:249、418 |
+
+`xTaskIncrementTick()` 在 tasks.c:5206 读取的是：
+
+```c
+xItemValue = listGET_LIST_ITEM_VALUE( &( pxTCB->xStateListItem ) );
+```
+
+因为此刻它是在遍历**延时表**，表头排序键是唤醒时刻。事件表上的
+`xEventListItem` 不参与这个比较。把两者混淆，会得出“tick 中断按优先级唤醒”
+或“事件表按时间排序”的错误结论。
+
+需要特别区分事件组的“无序事件链表”：
+
+- `vTaskPlaceOnUnorderedEventList()`（tasks.c:5756-5786）不是插入有序表，
+  而是用 `listINSERT_END()` 追加到末尾；
+- 它把 `xItemValue` 写成
+  `uxBitsToWaitFor | 控制位 | taskEVENT_LIST_ITEM_VALUE_IN_USE`
+  （tasks.c:5774），不是优先级编码；
+- `taskEVENT_LIST_ITEM_VALUE_IN_USE` 是 tick 类型最高位
+  （tasks.c:356-365），告诉调度器“这个 item 值被借用，不要按优先级改写它”；
+- 事件组用 `vTaskRemoveFromUnorderedEventList()`（tasks.c:5930）
+  而不是 `xTaskRemoveFromEventList()`。
+
+所以“事件表按优先级排序”只对队列/信号量成立；事件组刻意使用无序表，
+把排序键复用为等待条件。这一点是本知识库旧版笔记最容易漏掉的例外。
+
+### 7.4.2 `pxContainer` 是“当前是否挂在某条链表”的判据
+
+list.h:415：
+
+```c
+#define listLIST_ITEM_CONTAINER( pxListItem )    ( ( pxListItem )->pxContainer )
+```
+
+- 插入链表时，`vListInsert()`/`vListInsertEnd()` 把 `pxContainer` 指向该链表；
+- `uxListRemove()`/`listREMOVE_ITEM()` 摘除时把 `pxContainer` 置 `NULL`；
+- 因此 `listLIST_ITEM_CONTAINER(item) != NULL` 等价于“该项当前属于某条链表”。
+
+tasks.c:5228 用这个宏判断任务是否还在等事件：
+
+```c
+if( listLIST_ITEM_CONTAINER( &( pxTCB->xEventListItem ) ) != NULL )
+{
+    listREMOVE_ITEM( &( pxTCB->xEventListItem ) );
+}
+```
+
+超时路径先把任务从延时表摘除，再检查事件项；如果任务同时在等队列，
+事件项还挂在队列的等待链表上，必须一起摘除。否则事件链表会保留一个
+已经因超时恢复运行的任务，之后事件到达时 `xTaskRemoveFromEventList()`
+会再次操作该 TCB，破坏状态一致性。
+
+### 7.4.3 `listGET_OWNER_OF_HEAD_ENTRY` 取的是宿主，不是链表项
+
+list.h:396：
+
+```c
+#define listGET_OWNER_OF_HEAD_ENTRY( pxList ) \
+    ( ( &( ( pxList )->xListEnd ) )->pxNext->pvOwner )
+```
+
+`pxList->xListEnd.pxNext` 是第一个真实项；`pvOwner` 是嵌入该链表项的宿主对象。
+在 tasks.c 中，宿主是 `TCB_t`，所以 tasks.c:5205 可以直接把返回值赋给
+`TCB_t * pxTCB`，不需要额外偏移计算。`listGET_OWNER_OF_NEXT_ENTRY` 则还会
+推进 `pxIndex`，用于同优先级轮转；两者不能互换。
+
+### 7.4.4 `listINSERT_END` 与 `vListInsert` 的选择
+
+- `prvAddTaskToReadyList()`（tasks.c:336-342）使用 `listINSERT_END`：
+  就绪表不要求按值排序，插到 `pxIndex` 前一位即可；同优先级任务按到达顺序轮转。
+- `vTaskPlaceOnEventList()`（tasks.c:5725）和
+  `prvAddCurrentTaskToDelayedList()`（tasks.c:9106）使用 `vListInsert`：
+  事件表按优先级编码排序，延时表按唤醒时刻排序，需要有序插入。
+- 选择错误的插入函数会破坏“表头即最高优先级/最早到期”的前提，
+  使 O(1) 取表头失效。
+
+### 7.4.5 校验清单
+
+看到 list 相关注释时，核对：
+
+1. 这个链表项的 `xItemValue` 是谁写的？是时间还是优先级？
+2. 当前项是否还在链表里？用 `pxContainer` 判断，不要凭 `pxNext`/`pxPrevious` 推断。
+3. 插入用 `vListInsert` 还是 `listINSERT_END`？是否依赖有序性？
+4. 摘除用 `uxListRemove` 还是 `listREMOVE_ITEM`？前者返回剩余项数，后者无返回值。
+5. 摘除后是否需要重新插入就绪表？`pxContainer == NULL` 之后项可以被重新挂载。
+
+## 7.5 一句话总结
 
 - **list.h 管"是什么"**：3 个类型 + 17 个宏；**list.c 管"怎么动"**：5 个函数、约 200 行有效代码。
 - 全部 O(1) 操作的前提是 **`pvOwner` + `pxContainer` 两个反向指针**；

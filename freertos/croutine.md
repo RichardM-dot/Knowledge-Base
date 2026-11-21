@@ -1,8 +1,8 @@
 # croutine.c 与 croutine.h —— 协程完全解读
 
-> 对应源文件（本地仓库 `~/workspace/freertos/`，FreeRTOS-Kernel V11.1.0+，行号以当前文件为准）：
-> - [croutine.c](/Users/theo-richard/workspace/freertos/croutine.c)（435 行）—— 协程实现，**全文件只有 5 个函数**
-> - [include/croutine.h](/Users/theo-richard/workspace/freertos/include/croutine.h)（735 行）—— 类型定义 + 协程专用宏
+> 对应源文件（本地仓库 `~/workspace/references/rtos/freertos/`，FreeRTOS-Kernel V11.1.0+，行号以当前文件为准）：
+> - [croutine.c](/Users/theo-richard/workspace/references/rtos/freertos/croutine.c)（435 行）—— 协程实现，**全文件只有 5 个函数**
+> - [include/croutine.h](/Users/theo-richard/workspace/references/rtos/freertos/include/croutine.h)（735 行）—— 类型定义 + 协程专用宏
 >
 > **前置阅读：** [list.md](list.md) → [tasks.md](tasks.md) → [queue.md](queue.md)
 > **配置项：** [freertosconfigh.md](freertosconfigh.md)
@@ -345,7 +345,7 @@ vCoRoutineSchedule( void )                        croutine.c:322
 ```text
 vCoRoutineAddToDelayedList( xTicksToDelay, pxEventList )    croutine.c:184
   ├─ uxListRemove( &pxCurrentCoRoutine->xGenericListItem )          201
-  │    └─ 先离开就绪表（与 tasks.c:9024 同款）
+  │    └─ 先离开就绪表（与 tasks.c:9128 同款）
   ├─ listSET_LIST_ITEM_VALUE( &xGenericListItem, xTimeToWake )      204
   │    └─ 写排序键 = 绝对唤醒时刻
   ├─ vListInsert( 当前或溢出延时表, &xGenericListItem )              （按时刻升序）
@@ -367,7 +367,7 @@ xCoRoutineRemoveFromEventList( pxEventList )    croutine.c:386
   └─ 返回"是否需要让出"
 ```
 
-**与 `xTaskRemoveFromEventList`（tasks.c:5732）几乎逐行对应**，只是操作对象从 TCB 换成 CRCB。
+**与 `xTaskRemoveFromEventList`（tasks.c:5831）几乎逐行对应**，只是操作对象从 TCB 换成 CRCB。
 
 ## 3.6 复位：`vCoRoutineResetState`（croutine.c:420）
 
@@ -627,7 +627,62 @@ grep -n "#define crSTART\|#define crEND\|#define crSET_STATE0\|#define crDELAY" 
 # 期望：210 crSTART / 247 crEND / 254 crSET_STATE0 / 308 crDELAY
 ```
 
-## 6.4 一句话总结
+## 6.4 注释级精读：协作式任务调度 ≠ 协程
+
+这是两个不同层面的“协作”，经常被混为一谈。
+
+### 6.4.1 两个配置宏控制的是不同对象
+
+| 配置 | 控制对象 | 位置 | 含义 |
+|---|---|---|---|
+| `configUSE_PREEMPTION` | **任务**调度策略 | FreeRTOSConfig.h:82-85 | 0：任务只在显式让出/阻塞时切换 |
+| `configUSE_CO_ROUTINES` | **协程**功能是否编译 | FreeRTOSConfig.h:395-399 | 1：包含 croutine.c；0：不包含 |
+
+`configUSE_PREEMPTION=0` 不会启用协程；`configUSE_CO_ROUTINES=1`
+也不会关闭任务抢占。两者可以任意组合，互不替代。
+
+### 6.4.2 协作式任务仍然有独立栈
+
+- 每个任务有独立 `pxStack` 和 `pxTopOfStack`（tasks.c:427、440）；
+- 上下文切换保存/恢复 R4-R11 等寄存器到各自任务栈；
+- `configUSE_PREEMPTION=0` 只改变“何时请求切换”，不改变“切换时保存到哪个栈”。
+
+### 6.4.3 协程共享一个栈
+
+- 协程的“切换”不是硬件上下文切换，而是 `switch( uxState )` 跳到
+  `case __LINE__*2`（croutine.h 的 `crSTART`/`crEND`/`crSET_STATE0`）；
+- 局部变量必须 `static`，因为函数返回后栈帧失效；
+- `vCoRoutineSchedule()`（croutine.c:322）由某个**任务**调用，
+  在该任务的栈上依次运行协程；
+- 协程没有独立 TCB，只有 `CRCB_t`；没有 `pxTopOfStack`；
+- 协程的延时链表由 `vCoRoutineAddToDelayedList()`（croutine.c:184）维护，
+  不是任务延时表 `pxDelayedTaskList`。
+
+### 6.4.4 “协作式调度器的函数定义在哪里”再回答一次
+
+如果你问的是 `configUSE_PREEMPTION=0` 的任务调度器：
+
+- 没有单独的调度函数；`vTaskSwitchContext()`（tasks.c:5532）仍然存在；
+- `xTaskIncrementTick()` 的抢占/时间片分支被条件编译移除；
+- 切换由 `taskYIELD()`、阻塞 API 或 ISR 退出请求触发；
+- 空闲任务在协作式下每轮 `taskYIELD()`（tasks.c:6284-6292）。
+
+如果你问的是协程调度器：
+
+- 入口是 `vCoRoutineSchedule()`（croutine.c:322）；
+- 它由任务显式调用，自身不是任务，也不参与 FreeRTOS 任务优先级调度；
+- 协程的“让出”由 `crDELAY`/`crWAIT` 等宏改变 `uxState` 实现，
+  不经过 PendSV。
+
+### 6.4.5 校验清单
+
+1. 当前讨论的是任务还是协程？
+2. 配置宏是 `configUSE_PREEMPTION` 还是 `configUSE_CO_ROUTINES`？
+3. 切换是否经过 PendSV/`vTaskSwitchContext()`？
+4. 栈是每任务独立，还是所有协程共享？
+5. 延时项挂在任务延时表，还是协程延时表？
+
+## 6.5 一句话总结
 
 - **协程 = 用 `switch( uxState )` + `case __LINE__*2:` 手工实现的状态机**，
   本质是把"程序计数器"存进一个 2 字节字段，从而让函数能"返回后再从原处继续"。

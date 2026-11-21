@@ -1,8 +1,8 @@
 # stream_buffer.c 与 stream_buffer.h —— 流缓冲 / 消息缓冲完全解读
 
-> 对应源文件（本地仓库 `~/workspace/freertos/`，FreeRTOS-Kernel V11.1.0+，行号以当前文件为准）：
-> - [stream_buffer.c](/Users/theo-richard/workspace/freertos/stream_buffer.c)（1796 行）—— 流缓冲 + 消息缓冲实现
-> - [include/stream_buffer.h](/Users/theo-richard/workspace/freertos/include/stream_buffer.h)（909 行）—— 类型与 API 声明
+> 对应源文件（本地仓库 `~/workspace/references/rtos/freertos/`，FreeRTOS-Kernel V11.1.0+，行号以当前文件为准）：
+> - [stream_buffer.c](/Users/theo-richard/workspace/references/rtos/freertos/stream_buffer.c)（1796 行）—— 流缓冲 + 消息缓冲实现
+> - [include/stream_buffer.h](/Users/theo-richard/workspace/references/rtos/freertos/include/stream_buffer.h)（909 行）—— 类型与 API 声明
 >
 > **前置阅读：** [list.md](list.md) → [tasks.md](tasks.md) → [queue.md](queue.md)
 > **配置项：** [freertosconfigh.md](freertosconfigh.md)
@@ -681,7 +681,107 @@ grep -n "static size_t prvBytesInBuffer"                   stream_buffer.c
 1614:static size_t prvBytesInBuffer( const StreamBuffer_t * const pxStreamBuffer )
 ```
 
-## 6.4 一句话总结
+## 6.4 注释级精读：任务通知状态、索引与超时
+
+流缓冲区用任务通知替代队列等待链表，因此它直接依赖 TCB 的
+`ucNotifyState[]` 和 `ulNotifiedValue[]`。理解这两个字段，才能理解
+`xStreamBufferSend()`/`xStreamBufferReceive()` 的阻塞与超时。
+
+### 6.4.1 通知索引
+
+`StreamBuffer_t` 中有 `uxNotificationIndex` 字段；API 通过
+`xTaskNotifyWaitIndexed()`、`xTaskNotifyIndexed()` 使用该索引
+（stream_buffer.c:86、167、927、1157）。
+
+TCB 中对应两个数组（tasks.c:486-487）：
+
+```c
+volatile uint32_t ulNotifiedValue[ configTASK_NOTIFICATION_ARRAY_ENTRIES ];
+volatile uint8_t  ucNotifyState[ configTASK_NOTIFICATION_ARRAY_ENTRIES ];
+```
+
+`uxNotificationIndex` 必须小于 `configTASK_NOTIFICATION_ARRAY_ENTRIES`，
+否则数组越界。默认每个任务只有 1 个通知槽（FreeRTOS.h:2833-2835）。
+
+### 6.4.2 等待前为什么清除通知状态
+
+stream_buffer.c:911-912：
+
+```c
+/* 即将等待空间，清除通知状态。 */
+( void ) xTaskNotifyStateClearIndexed( NULL, pxStreamBuffer->uxNotificationIndex );
+```
+
+`ucNotifyState` 有三个值（tasks.c:152-154）：
+
+| 值 | 含义 | 何时置位 |
+|---|---|---|
+| 0 `NOT_WAITING` | 未等待 | 初始化；等待结束；显式清除 |
+| 1 `WAITING` | 正在等待 | `xTaskNotifyWaitIndexed()` 真正阻塞前（tasks.c:8231） |
+| 2 `RECEIVED` | 已收到通知 | `xTaskNotifyIndexed()` 置位（tasks.c:8451） |
+
+通知状态是“粘滞”的：如果上一次通知在任务恢复后才被处理，
+`ucNotifyState` 可能仍为 `RECEIVED`。下一次等待前若不清除，
+`xTaskNotifyWaitIndexed()` 会认为“已经有通知”，立即返回而不是阻塞，
+导致流缓冲区在缓冲区仍满/仍空时忙循环。
+
+因此发送/接收路径在设置 `xTaskWaitingToSend`/`xTaskWaitingToReceive`
+之前先调用 `xTaskNotifyStateClearIndexed()`（stream_buffer.c:912、1140）。
+
+### 6.4.3 通知动作是 `eNoAction`
+
+stream_buffer.c:86-90：
+
+```c
+( void ) xTaskNotifyIndexed( xTaskWaitingToSend,
+                             uxNotificationIndex,
+                             ( uint32_t ) 0,
+                             eNoAction );
+```
+
+`eNoAction` 表示：
+
+- 不修改 `ulNotifiedValue[]`；
+- 只把 `ucNotifyState` 置为 `RECEIVED`；
+- 如果目标任务正在 `WAITING`，将其从阻塞态唤醒。
+
+流缓冲区不需要传递 32 位计数值，通知只承担“有空间/有数据”的二值事件。
+这也是它比队列轻量的原因之一：没有等待链表、没有数据拷贝到等待者，
+只用每任务的 1 字节状态和 0 字节值（`eNoAction` 不改值）。
+
+### 6.4.4 超时与通知状态
+
+`xTaskNotifyWaitIndexed(..., xTicksToWait)` 内部把任务挂到延时表；
+超时后：
+
+- `xTaskIncrementTick()` 在 tasks.c:5223 摘除 `xStateListItem`；
+- 任务恢复运行；
+- `xTaskNotifyWaitIndexed()` 返回 `pdFALSE`；
+- 调用方（stream_buffer.c:927 之后）把 `xTaskWaitingToSend` 置 `NULL`，
+  然后由 `xTaskCheckForTimeOut()` 决定是否继续等待。
+
+如果通知在超时前到达，`xTaskNotifyIndexed()` 在 tasks.c:8652-8653
+把任务从延时表摘除并加入就绪表；`ucNotifyState` 为 `RECEIVED`，
+等待函数返回 `pdTRUE`。
+
+### 6.4.5 为什么 `ucNotifyState` 是 `uint8_t`
+
+- 只有 0/1/2 三个状态，1 字节足够；
+- 每个任务可能有多个通知索引，数组按字节增长比按 `UBaseType_t` 增长更省 RAM；
+- 字节访问在 Cortex-M 上是原子的；位域需要读-改-写，增加并发复杂度；
+- `ulNotifiedValue` 必须是 32 位，不能把状态压在值的高位，否则会丢失计数值。
+
+详见 [tasks.md](tasks.md) 5.4。
+
+### 6.4.6 校验清单
+
+1. 当前使用的通知索引是否小于 `configTASK_NOTIFICATION_ARRAY_ENTRIES`？
+2. 等待前是否清除了可能残留的 `RECEIVED` 状态？
+3. 通知动作是 `eNoAction` 还是 `eIncrement`/`eSetBits`？流缓冲区是否需要值？
+4. 超时后是否清空 `xTaskWaitingToSend`/`xTaskWaitingToReceive`？
+5. 只有一个读任务和一个写任务吗？多读者/多写者会破坏单通知槽假设。
+
+## 6.5 一句话总结
 
 - **流缓冲 = 字节环 + 触发阈值 + 两个任务句柄**；**消息缓冲 = 流缓冲 + 4 字节长度头**，
   同一结构、同一套代码，靠 `ucFlags` 区分。

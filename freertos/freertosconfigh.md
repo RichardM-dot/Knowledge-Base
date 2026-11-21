@@ -181,7 +181,7 @@ MPU v2 wrapper 还要求 `configPROTECTED_KERNEL_OBJECT_POOL_SIZE`、`configSYST
 | 107 | `configUSE_TICKLESS_IDLE` | `0` | 1 启用低功耗无 tick 模式；0 保持 tick 中断始终运行。 |
 | 112 | `configMAX_PRIORITIES` | `5` | 可用任务优先级数量，任务优先级范围 0 到 4，0 最低。 |
 | 118 | `configMINIMAL_STACK_SIZE` | `128` | 空闲任务栈大小，单位是字不是字节；也常被演示程序复用。 |
-| 122 | `configMAX_TASK_NAME_LEN` | `16` | 任务名称最大字符数，包含 NULL 终止符。 |
+| 122 | `configMAX_TASK_NAME_LEN` | `16` | 任务名称数组总长度，**包含 NULL 终止符**；多核空闲任务还要额外预留 1 个核心号字符。 |
 | 139 | `configTICK_TYPE_WIDTH_IN_BITS` | `TICK_TYPE_WIDTH_32_BITS` | 设置 TickType_t 位宽；当前为无符号 32 位。 |
 | 145 | `configIDLE_SHOULD_YIELD` | `1` | 1 时空闲任务会让给同优先级的可运行应用任务；0 时空闲任务用完整个时间片。 |
 | 151 | `configTASK_NOTIFICATION_ARRAY_ENTRIES` | `1` | 每个任务通知数组的索引数量；当前每任务 1 个通知槽。 |
@@ -217,7 +217,7 @@ MPU v2 wrapper 还要求 `configPROTECTED_KERNEL_OBJECT_POOL_SIZE`、`configSYST
 | 365 | `configCHECK_FOR_STACK_OVERFLOW` | `2` | 上下文切换时检查栈溢出；2 检查栈末尾模式是否被覆盖，需提供溢出回调。 |
 | 376 | `configGENERATE_RUN_TIME_STATS` | `0` | 1 收集每个任务的处理时间统计；需要应用提供时钟源。 |
 | 382 | `configUSE_TRACE_FACILITY` | `0` | 1 在任务结构中包含跟踪和可视化工具使用的附加字段。 |
-| 389 | `configUSE_STATS_FORMATTING_FUNCTIONS` | `0` | 1 包含 `vTaskList()`/`vTaskGetRunTimeStats()`，会引入字符串格式化依赖。 |
+| 389 | `configUSE_STATS_FORMATTING_FUNCTIONS` | `0` | `>0` 编译 `vTaskListTasks()`/`vTaskGetRunTimeStatistics()`；`1` 还由 tasks.c 包含 `<stdio.h>`，`2` 不包含（需自行提供 `snprintf` 声明）。详见下方补充。 |
 | 399 | `configUSE_CO_ROUTINES` | `0` | 1 包含协程功能，需要包含 `croutine.c`。 |
 | 404 | `configMAX_CO_ROUTINE_PRIORITIES` | `1` | 应用程序协程可用的优先级数量。 |
 | 420 | `configASSERT(x)` | 多行定义 420-426 | 断言宏；x 为 0 时关中断并死循环，用于调试时捕获错误。 |
@@ -269,6 +269,167 @@ MPU v2 wrapper 还要求 `configPROTECTED_KERNEL_OBJECT_POOL_SIZE`、`configSYST
 | 671 | `INCLUDE_xTaskAbortDelay` | `0` | 包含 `xTaskAbortDelay()`，中止任务延时；当前关闭。 |
 | 672 | `INCLUDE_xTaskGetHandle` | `0` | 包含 `xTaskGetHandle()`，按名称获取任务句柄；当前关闭。 |
 | 673 | `INCLUDE_xTaskResumeFromISR` | `1` | 包含 `xTaskResumeFromISR()`，在中断中恢复任务。 |
+
+### 配置项联动与源码定位（补充）
+
+这一节不重复表格，而是回答“改了某个宏，tasks.c 里到底哪段代码生效/消失”。
+行号基准为当前工作区的
+[tasks.c](/Users/theo-richard/workspace/references/rtos/freertos/tasks.c) 与
+[FreeRTOS.h](/Users/theo-richard/workspace/references/rtos/freertos/include/FreeRTOS.h)。
+
+#### 1. `configUSE_PREEMPTION`：协作式不是另一套调度器
+
+- 模板位置：`FreeRTOSConfig.h:82-85`。
+- `1`：抢占式；`0`：协作式。
+- FreeRTOS.h:191-192 强制要求必须定义，且只能是 0/1。
+- 协作式下 tasks.c 的具体变化：
+
+| 位置 | 抢占式行为 | 协作式行为 |
+|---|---|---|
+| tasks.c:110-111 | 宏有实现 | 两个让出宏展开为空 |
+| tasks.c:5245-5269 | 到期任务唤醒后比较优先级，可能置 `xSwitchRequired` | 整段不编译 |
+| tasks.c:5278-5309 | 时间片轮转 | 整段不编译 |
+| tasks.c:5327-5372 | 聚合 `xYieldPendings` | 整段不编译 |
+| tasks.c:6284-6292 | 空闲任务不强制让出 | 空闲任务每轮 `taskYIELD()` |
+| tasks.c:5532 | `vTaskSwitchContext()` 仍存在 | 仍存在，由显式让出/阻塞调用 |
+
+结论：协作式没有独立的 `vTaskSwitchContextCooperative()`；
+它靠条件编译移除“tick 驱动的抢占”，保留“显式让出/阻塞驱动的切换”。
+
+#### 2. `configUSE_TIME_SLICING`：只在抢占式下有意义
+
+- 模板位置：`FreeRTOSConfig.h:87-92`。
+- 真正生效的条件是 tasks.c:5278：
+  `configUSE_PREEMPTION == 1 && configUSE_TIME_SLICING == 1`。
+- 若 `configUSE_PREEMPTION=0`，即使 `configUSE_TIME_SLICING=1`，
+  tasks.c:5278-5309 也不会编译。
+- 单核判断的是当前任务所在优先级的就绪表长度（tasks.c:5282）；
+  长度包含当前任务本身，所以 `> 1` 表示还有同优先级就绪任务。
+- 多核逐核判断（tasks.c:5295-5305），写各自核心的 `xYieldPendings[]`。
+
+#### 3. `configMAX_TASK_NAME_LEN`：包含 `'\0'`，多核还要留核心号
+
+- 模板位置：`FreeRTOSConfig.h:120-122`；默认值 16 在 FreeRTOS.h:373-374。
+- 语义：`char pcTaskName[configMAX_TASK_NAME_LEN]` 的**数组总长度**，
+  包含结尾 `'\0'`；不是“可见字符数”。
+- 普通任务复制：tasks.c:1997-2031，最多复制 `configMAX_TASK_NAME_LEN - 1`
+  个字符，并在最后一个字节强制写 `'\0'`。
+- 空闲任务名：tasks.c:3797-3827 先复制基础名称，复制上界是
+  `configMAX_TASK_NAME_LEN - taskRESERVED_TASK_NAME_LENGTH`
+  （tasks.c:3809）。
+- 多核空闲任务还要追加核心号字符和 `'\0'`（tasks.c:3866-3867），所以
+  `taskRESERVED_TASK_NAME_LENGTH = 2`（tasks.c:210）；单核只留 `'\0'`，
+  值为 1（tasks.c:217）。
+- 编译期检查：
+  - 多核：`configMAX_TASK_NAME_LEN < 2U` → `#error`（tasks.c:207-209）；
+  - 单核：`configMAX_TASK_NAME_LEN < 1U` → `#error`（tasks.c:214-216）。
+- 多核检查 `< 2` 的直接原因：防止
+  `configMAX_TASK_NAME_LEN - 2U` 无符号下溢，导致 tasks.c:3809 的循环
+  越界写入 `cIdleName[]`。
+- “最多 9 个核”不是 `configNUMBER_OF_CORES` 的硬限制，而是空闲任务名
+  使用单字符 `xCoreID + '0'` 的编码限制（tasks.c:3866）：
+  核心号 0-9 可以表示为 `'0'`-`'9'`；核心号 10（第 11 个核心）起会变成 `':'`
+  等非数字字符。这只影响调试名称，不影响调度。
+
+#### 4. `configCHECK_FOR_STACK_OVERFLOW`：1 与 2 的依赖不同
+
+- 模板位置：`FreeRTOSConfig.h:355-365`。
+- `0`：不检查。
+- `1`：上下文切换时只比较 `pxTopOfStack` 是否越过栈边界
+  （stack_macros.h:62-93）；速度快，但只能在栈指针已经越界时发现。
+- `2`：检查栈底预填充模式是否被覆盖（stack_macros.h:96-115），
+  能捕获“已经写穿栈底但栈指针尚未越界”的情况；需要创建任务时填充栈。
+- 填充开关在 tasks.c:171-175：`configCHECK_FOR_STACK_OVERFLOW > 1`
+  是四个条件之一。其他三个是：
+  `configUSE_TRACE_FACILITY == 1`、
+  `INCLUDE_uxTaskGetStackHighWaterMark == 1`、
+  `INCLUDE_uxTaskGetStackHighWaterMark2 == 1`。
+- 填充值 `tskSTACK_FILL_BYTE = 0xA5`（tasks.c:160），填充动作在
+  tasks.c:1963-1968，扫描在 tasks.c:6831-6848。
+- 该填充依赖 `memset`：声明来自 tasks.c:60 的 `<string.h>`，
+  定义由工具链 C 库提供（如 newlib 的 `libc.a`），不是 FreeRTOS 实现。
+- 高水位线 API 返回的是“剩余未使用栈的最小值”（单位：`StackType_t` 字），
+  不是“历史最大使用量”；最大使用量 = 创建时栈深度 - 返回值。
+
+#### 5. `configUSE_TASK_NOTIFICATIONS` 与 `ucNotifyState`
+
+- 模板位置：`FreeRTOSConfig.h:645`（默认 1）。
+- 每任务通知槽数量由 `configTASK_NOTIFICATION_ARRAY_ENTRIES` 控制，
+  默认 1（FreeRTOS.h:2833-2835），且必须 ≥1（FreeRTOS.h:2837-2839）。
+- TCB 中两个数组（tasks.c:486-487）：
+
+```c
+volatile uint32_t ulNotifiedValue[ configTASK_NOTIFICATION_ARRAY_ENTRIES ];
+volatile uint8_t  ucNotifyState[ configTASK_NOTIFICATION_ARRAY_ENTRIES ];
+```
+
+- 状态值只有 0/1/2（tasks.c:152-154），用 `uint8_t` 是因为 C 没有标准 2 位
+  标量类型，字节是最小可寻址单位；位域会引入读-改-写和实现定义布局。
+- `volatile` 只保证每次访问实际发生，不保证多字段操作的原子性；
+  通知路径用 `taskENTER_CRITICAL()` 保护状态与值的组合更新。
+
+#### 6. `configUSE_STATS_FORMATTING_FUNCTIONS`：0、1、2 的真实差异
+
+- 模板位置：`FreeRTOSConfig.h:384-389`。
+- `0`：不编译格式化函数，不包含 `<stdio.h>`。
+- `1`：编译格式化函数，并由 tasks.c:94-102 包含 `<stdio.h>`。
+- `2`：编译格式化函数，但 tasks.c:94 的 `== 1` 不成立，**不包含**
+  `<stdio.h>`。
+- 函数是否编译看的是 `> 0`：
+  - tasks.c:7763（辅助函数）
+  - tasks.c:7791（`vTaskListTasks`）
+  - tasks.c:7960（`vTaskGetRunTimeStatistics`）
+- 值 2 不会自动提供 `snprintf` 声明。tasks.c:7902/7914/8055/8070/8088/8102
+  仍然调用 `snprintf`；声明必须由 `FreeRTOSConfig.h` 包含 `<stdio.h>`、
+  编译器 `-include`、或其他包含链提供。否则 C99 及以上会报
+  `implicit declaration of function 'snprintf'`。
+- 合法性检查：FreeRTOS.h:2869-2876 要求
+  `configSUPPORT_DYNAMIC_ALLOCATION == 1`，且
+  `configUSE_TRACE_FACILITY` 或 `configGENERATE_RUN_TIME_STATS` 至少一个为 1。
+
+#### 7. `configNUMBER_OF_CORES`：SMP 与空闲任务命名
+
+- 模板位置：`FreeRTOSConfig.h:509-514`（默认 1，模板中为注释示例）。
+- 单核：`pxCurrentTCB` 是一个指针（tasks.c:517）；
+  多核：`pxCurrentTCBs[configNUMBER_OF_CORES]`（tasks.c:522），
+  并用宏 `#define pxCurrentTCB xTaskGetCurrentTaskHandle()`（tasks.c:523）。
+- TCB 中的 `xTaskRunState`、`uxTaskAttributes` 只在多核时存在
+  （tasks.c:441-444）。
+- 多核空闲任务名追加核心号（tasks.c:3854-3867）；单字符编码只保证
+  0-9 的数字字符正确，更多核心时名称可能失真，但不影响调度。
+- 多核的让出逻辑不能用单核的“比较 `pxCurrentTCB`”实现：
+  `prvYieldForTask()`（tasks.c:975-1090）会选择目标核心并调用
+  `prvYieldCore()`（tasks.c:400-416）发核间中断。
+
+#### 8. `configSUPPORT_STATIC_ALLOCATION` / `configSUPPORT_DYNAMIC_ALLOCATION`
+
+- 两者不能同时为 0（FreeRTOS.h:2909-2911）。
+- 只有当“静态和动态两种创建方式都可能”时，TCB 才需要
+  `ucStaticallyAllocated` 字段（tasks.c:493-496）；
+  该条件由 FreeRTOS.h:3128-3130 的
+  `tskSTATIC_AND_DYNAMIC_ALLOCATION_POSSIBLE` 计算。
+- 三个状态码（tasks.c:163-165）是互斥状态，不是可按位组合的位标志：
+  - `0`：栈和 TCB 都动态分配；
+  - `1`：仅栈静态分配（TCB 动态）；
+  - `2`：栈和 TCB 都静态分配。
+- 赋值点：tasks.c:1420、1537（全静态）、1657（仅栈静态）、1844（全动态）。
+- 使用点：`prvDeleteTCB()` 的 tasks.c:6961-6982，以及
+  `xTaskGetStaticBuffers()` 的 tasks.c:4746-4763。
+
+#### 9. 配置检查的阅读方法
+
+遇到配置相关的编译错误，按以下顺序排查：
+
+1. 在 `FreeRTOSConfig.h` 中找到宏定义，确认没有重复定义/拼写错误；
+2. 在 `FreeRTOS.h` 中找 `#ifndef config...` 默认值和 `#error` 组合检查；
+3. 在 `tasks.c` 中找该宏参与的 `#if`，确认当前值选中哪个分支；
+4. 用预处理器展开确认：
+
+```bash
+arm-none-eabi-gcc -E -dM -I<include路径> tasks.c | grep configUSE_
+```
+
+5. 若涉及 `snprintf`/`memset`，再检查头文件包含链和链接库，而不是只改宏值。
 
 ---
 

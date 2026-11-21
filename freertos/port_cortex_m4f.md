@@ -1,8 +1,8 @@
 # port.c 与 portmacro.h（Cortex-M4F）—— 移植层与上下文切换完全解读
 
-> 对应源文件（本地仓库 `~/workspace/freertos/`）：
-> - [portable/GCC/ARM_CM4F/port.c](/Users/theo-richard/workspace/freertos/portable/GCC/ARM_CM4F/port.c)（972 行）
-> - [portable/GCC/ARM_CM4F/portmacro.h](/Users/theo-richard/workspace/freertos/portable/GCC/ARM_CM4F/portmacro.h)（272 行）
+> 对应源文件（本地仓库 `~/workspace/references/rtos/freertos/`）：
+> - [portable/GCC/ARM_CM4F/port.c](/Users/theo-richard/workspace/references/rtos/freertos/portable/GCC/ARM_CM4F/port.c)（972 行）
+> - [portable/GCC/ARM_CM4F/portmacro.h](/Users/theo-richard/workspace/references/rtos/freertos/portable/GCC/ARM_CM4F/portmacro.h)（272 行）
 >
 > **前置阅读：** [list.md](list.md) → [tasks.md](tasks.md)（必需，本文是它的最后一环）
 > 其余：[queue.md](queue.md) / [timers.md](timers.md) / [event_groups.md](event_groups.md) / [stream_buffer.md](stream_buffer.md) / [croutine.md](croutine.md)
@@ -231,8 +231,8 @@ configASSERT( ( configMAX_SYSCALL_INTERRUPT_PRIORITY & 0x1U ) == 0U );          
 
 | 宏 | 行号 | 动作 |
 |---|---:|---|
-| `portRECORD_READY_PRIORITY( prio, mask )` | 170 | `mask |= ( 1UL << prio )` |
-| `portRESET_READY_PRIORITY( prio, mask )` | 171 | `mask &= ~( 1UL << prio )` |
+| `portRECORD_READY_PRIORITY( prio, mask )` | 170 | 按位或：`mask` 置位 `1UL << prio` |
+| `portRESET_READY_PRIORITY( prio, mask )` | 171 | 按位清除：`mask` 清掉 `1UL << prio` |
 | `portGET_HIGHEST_PRIORITY( top, mask )` | 175 | `top = 31 - __CLZ( mask )` |
 
 **这就是 `configUSE_PORT_OPTIMISED_TASK_SELECTION=1` 时 O(1) 选任务的实现**：
@@ -249,6 +249,84 @@ configASSERT( ( configMAX_SYSCALL_INTERRUPT_PRIORITY & 0x1U ) == 0U );          
 | `portTASK_FUNCTION` | 137 | 同上（实现用） |
 | `portFORCE_INLINE` | 191-192 | `inline __attribute__((always_inline))` |
 | `portMEMORY_BARRIER()` | 264 | `__asm volatile( "" ::: "memory" )`（阻止编译器重排） |
+
+## 2.5 `portYIELD_WITHIN_API`、`taskYIELD` 与单核让出宏
+
+### 2.5.1 名称链
+
+| 名称 | 定义位置 | 展开/作用 |
+|---|---|---|
+| `taskYIELD()` | task.h:237 | `portYIELD()` |
+| `taskYIELD_WITHIN_API()` | task.h:3286-3290 | 单核：`portYIELD_WITHIN_API()`；多核：`vTaskYieldWithinAPI()` |
+| `portYIELD_WITHIN_API` | FreeRTOS.h:2737-2739 | 若移植层未定义，默认 `portYIELD` |
+| `portYIELD()` | portmacro.h:90-99 | 写 `ICSR.PENDSVSET`，执行 `DSB`/`ISB`；不立即切换 |
+| `xPortPendSVHandler` | port.c:546 | 真正的寄存器保存/恢复 |
+
+`portYIELD_WITHIN_API` 不是函数，是宏。它在 FreeRTOS.h 中的默认映射只保证
+“请求一次 PendSV”，不保证“马上切换”。
+
+### 2.5.2 单核让出宏为什么忽略 `pxTCB`
+
+tasks.c:121-125：
+
+```c
+#define taskYIELD_TASK_CORE_IF_USING_PREEMPTION( pxTCB ) \
+    do {                                                  \
+        ( void ) ( pxTCB );                               \
+        portYIELD_WITHIN_API();                           \
+    } while( 0 )
+```
+
+原因：
+
+1. 单核只有一个核心，运行中的任务必然是 `pxCurrentTCB`；
+2. TCB 的 `xTaskRunState` 字段只在 `configNUMBER_OF_CORES > 1` 时定义
+   （tasks.c:441-444），单核 TCB 没有这个字段；
+3. 让出目标是固定核心 0，不需要从 `pxTCB` 反查核心。
+
+`( void ) ( pxTCB );` 只用于消除“宏参数未使用”的编译警告。
+另一条 `taskYIELD_ANY_CORE_IF_USING_PREEMPTION` 的单核版本仍然读取
+`pxTCB->uxPriority`（tasks.c:129），用于判断是否值得让出；两条宏不能混用注释。
+
+### 2.5.3 协作式调度在移植层的表现
+
+`configUSE_PREEMPTION=0` 时：
+
+- tasks.c:110-111 把两个让出宏定义为空；调用点不产生代码；
+- `xTaskIncrementTick()` 不因任务到期置 `xSwitchRequired`
+  （tasks.c:5245-5269 不编译）；
+- 时间片判断整段不编译（tasks.c:5278-5309）；
+- 切换只由显式 `taskYIELD()`、阻塞 API（如 `vTaskDelay()` 在 tasks.c:2716
+  调用 `taskYIELD_WITHIN_API()`）或 ISR 退出请求触发；
+- 空闲任务在协作式下每轮调用 `taskYIELD()`（tasks.c:6284-6292），
+  使任何已就绪任务获得运行机会。
+
+移植层不需要为协作式实现另一套 PendSV；它仍然只负责“收到 PendSV 请求后
+保存/恢复上下文”，是否请求由内核的调度策略决定。
+
+### 2.5.4 SysTick 中调用 `xTaskIncrementTick` 的互斥条件
+
+port.c:602-629：
+
+```c
+void xPortSysTickHandler( void )
+{
+    portDISABLE_INTERRUPTS();
+    if( xTaskIncrementTick() != pdFALSE )
+    {
+        portNVIC_INT_CTRL_REG = portNVIC_PENDSVSET_BIT;
+    }
+    portENABLE_INTERRUPTS();
+}
+```
+
+`xTaskIncrementTick()` 本身没有 `taskENTER_CRITICAL()`；它依赖：
+
+- SysTick 处理程序在 port.c:609 关闭中断；
+- 或 `xTaskResumeAll()` 在 tasks.c:4364 的临界区内补算 pended ticks。
+
+因此不要在任务上下文直接调用 `xTaskIncrementTick()` 并假设它自带互斥；
+它是调度器内部接口（task.h:3302 声明），调用者必须满足互斥契约。
 
 ---
 
@@ -479,7 +557,7 @@ xPortSysTickHandler()                              port.c:602
   ├─ portDISABLE_INTERRUPTS()                      约 608
   │    （虽然是最低优先级，但仍要防自己被更高优先级中断打断）
   │
-  ├─ if( xTaskIncrementTick() != pdFALSE )         ★ 调用 tasks.c:5035
+  ├─ if( xTaskIncrementTick() != pdFALSE )         ★ 调用 tasks.c:5139
   │     ├─ 需要切换 → 挂起 PendSV
   │     │    portNVIC_INT_CTRL_REG = portNVIC_PENDSVSET_BIT
   │     │    ★ 注意：不在这里切换！只是"打个标记"
@@ -530,7 +608,7 @@ main()
   ├─ 硬件初始化、xTaskCreate(...) 若干
   │    └─ pxPortInitialiseStack 造好每个任务的初始栈帧     port.c:224
   │
-  └─ vTaskStartScheduler()                                 tasks.c:3898
+  └─ vTaskStartScheduler()                                 tasks.c:3957
        ├─ 创建空闲任务 / 定时器任务
        ├─ portDISABLE_INTERRUPTS()
        ├─ xSchedulerRunning = pdTRUE
@@ -564,7 +642,7 @@ main()
       ▼
  ② xPortSysTickHandler                          port.c:602
       ├─ portDISABLE_INTERRUPTS()
-      ├─ xTaskIncrementTick()                    tasks.c:5035
+      ├─ xTaskIncrementTick()                    tasks.c:5139
       │     ├─ xTickCount++
       │     ├─ 处理到期任务 → prvAddTaskToReadyList
       │     └─ 返回 pdTRUE（需要切换）
@@ -591,7 +669,7 @@ main()
       │  ── 选择新任务 ──
       ├─ stmdb sp!, {r0, r3}            暂存到 MSP
       ├─ msr basepri, max_syscall       关低优先级中断
-      ├─ bl vTaskSwitchContext          tasks.c:5428
+      ├─ bl vTaskSwitchContext          tasks.c:5532
       │     └─ taskSELECT_HIGHEST_PRIORITY_TASK
       │          └─ listGET_OWNER_OF_NEXT_ENTRY（pxIndex 轮转）
       │             → pxCurrentTCB 指向新任务
@@ -793,7 +871,66 @@ grep -n "#define portYIELD()\|#define portDISABLE_INTERRUPTS\|#define portENTER_
 # 期望：90 / 124 / 126 / 175
 ```
 
-## 5.4 一句话总结
+## 5.4 `STATIC`、`portREMOVE_STATIC_QUALIFIER` 与调试器
+
+这组宏不属于 Cortex-M4F 的硬件原语，但它决定了调试器能否看到内核内部变量，
+并且经常在阅读 tasks.c 时产生“这个变量为什么不是 static”的疑问。
+
+### 5.4.1 定义链
+
+tasks.c:186-194：
+
+```c
+#ifdef portREMOVE_STATIC_QUALIFIER
+    #define STATIC
+#else
+    #define STATIC    static
+#endif
+```
+
+- 默认：`STATIC` 是 `static`，文件作用域符号只有内部链接；
+- 定义 `portREMOVE_STATIC_QUALIFIER`：`STATIC` 为空，符号变为外部链接。
+
+`portREMOVE_STATIC_QUALIFIER` 由移植层定义，不是内核配置宏。
+例如 MPLAB PIC32 移植层在调试构建下定义它：
+
+```c
+/* portable/MPLAB/PIC32MX/portmacro.h:208-211 */
+#ifdef __DEBUG
+    #define portREMOVE_STATIC_QUALIFIER
+#endif
+```
+
+Cortex-M4F 的 `portable/GCC/ARM_CM4F/portmacro.h` **没有**定义它，
+所以本工程的 `STATIC` 仍为 `static`。
+
+### 5.4.2 “内核感知调试器”指什么
+
+这里的“内核”是 FreeRTOS 内核，不是 MCU 厂商的库内核，也不是 CPU 的特权级别。
+“内核感知调试器”是能识别 FreeRTOS 数据结构并进行线程/队列枚举的调试器功能，
+例如 SEGGER Ozone/J-Link、STM32CubeIDE 的 FreeRTOS 插件、OpenOCD RTOS awareness、
+Lauterbach TRACE32 的 RTOS 支持。
+
+这些工具通常需要：
+
+1. 通过 ELF 全局符号找到 `pxCurrentTCB`、`pxReadyTasksLists`、`pxDelayedTaskList`；
+2. 按 TCB 结构布局读取 `pxTopOfStack`、`uxPriority`、`pcTaskName`；
+3. 遍历就绪/延时/挂起链表。
+
+文件作用域的 `static` 变量在 ELF 中仍可能是局部符号（`STB_LOCAL`），
+但部分调试器的表达式求值或线程枚举只查询全局符号；去掉 `static` 可提高兼容性。
+tasks.c:425 保留 `tskTaskControlBlock` 旧名称、tasks.c:526-529 保留链表变量的
+文件作用域、tasks.c:571-576 的 `uxTopUsedPriority` 注释，都是同一类兼容性措施。
+
+### 5.4.3 使用边界
+
+- 只在调试构建启用；发布构建保留 `static`，减少符号暴露和潜在重名；
+- 去掉 `static` 可能改变编译器优化决策；
+- 它不是 FreeRTOS API 的一部分，换移植层/编译器后要重新验证调试器行为；
+- 若调试器仍看不到任务，先检查 ELF 是否带符号、优化级别是否过高、
+  `pxCurrentTCB` 是否被优化到寄存器，而不是盲目修改内核源码。
+
+## 5.5 一句话总结
 
 - **tasks.c 决定"切给谁"，port.c 真的"切过去"**：靠改 `pxCurrentTCB` 和 `PSP` 两个值，
   加上保存/恢复寄存器。

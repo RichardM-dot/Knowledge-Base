@@ -1,9 +1,9 @@
 # queue.c / queue.h / semphr.h —— 队列、信号量、互斥量完全解读
 
-> 对应源文件（本地仓库 `~/workspace/freertos/`，FreeRTOS-Kernel V11.1.0+，行号以当前文件为准）：
-> - [queue.c](/Users/theo-richard/workspace/freertos/queue.c)（3369 行）—— **队列、信号量、互斥量的唯一实现**
-> - [include/queue.h](/Users/theo-richard/workspace/freertos/include/queue.h)（1752 行）—— `Queue_t` 结构、队列 API 声明
-> - [include/semphr.h](/Users/theo-richard/workspace/freertos/include/semphr.h)（1095 行）—— **21 个宏，全部转发到 queue.c**
+> 对应源文件（本地仓库 `~/workspace/references/rtos/freertos/`，FreeRTOS-Kernel V11.1.0+，行号以当前文件为准）：
+> - [queue.c](/Users/theo-richard/workspace/references/rtos/freertos/queue.c)（3369 行）—— **队列、信号量、互斥量的唯一实现**
+> - [include/queue.h](/Users/theo-richard/workspace/references/rtos/freertos/include/queue.h)（1752 行）—— `Queue_t` 结构、队列 API 声明
+> - [include/semphr.h](/Users/theo-richard/workspace/references/rtos/freertos/include/semphr.h)（1095 行）—— **21 个宏，全部转发到 queue.c**
 >
 > **前置阅读：** [list.md](list.md)（链表）→ [tasks.md](tasks.md)（任务与调度）
 > **配置项：** [freertosconfigh.md](freertosconfigh.md)
@@ -299,7 +299,7 @@ xQueueGenericSend( xQueue, pvItemToQueue, xTicksToWait, xCopyPosition )  queue.c
   └─ 队列满 且要等待：
        ├─ 检查调度器是否挂起（挂起 + 非零等待 = 断言）            queue.c:约 1100
        ├─ vTaskPlaceOnEventList( &xTasksWaitingToSend, xTicksToWait )   queue.c:1119
-       │     └─ 把自己挂进"等发送"表 + 延时表（tasks.c:5621）
+       │     └─ 把自己挂进"等发送"表 + 延时表（tasks.c:5725）
        ├─ taskEXIT_CRITICAL()
        ├─ portYIELD_WITHIN_API()      ← 让出 CPU
        └─ 醒来后回到循环顶部重试（可能又满了，继续等）
@@ -358,7 +358,7 @@ xQueueSemaphoreTake( xQueue, xTicksToWait )   queue.c:1634
   │    ├─ 检查是否超时                          queue.c:1763
   │    ├─ ★ 若这是互斥量 → 触发优先级继承         queue.c:1778
   │    │      xInheritanceOccurred = xTaskPriorityInherit( pxQueue->u.xSemaphore.xMutexHolder )
-  │    │      └─ 把持有者的优先级临时提到"我"这么高（tasks.c:7013）
+  │    │      └─ 把持有者的优先级临时提到"我"这么高（tasks.c:7117）
   │    ├─ vTaskPlaceOnEventList( &xTasksWaitingToReceive, xTicksToWait )   queue.c:1789
   │    └─ 让出 CPU，醒来重试
   │
@@ -706,7 +706,7 @@ xQueueGenericSend( q, item, wait, pos )   queue.c:941
        ├─ wait == 0 → 返回 errQUEUE_FULL        queue.c:1085
        └─ wait > 0
             ├─ vTaskPlaceOnEventList( &xTasksWaitingToSend, wait )   queue.c:1119
-            │     └─ 挂进"等发送"表 + 延时表（tasks.c:5621）
+            │     └─ 挂进"等发送"表 + 延时表（tasks.c:5725）
             ├─ 出临界区 → 让出 CPU
             └─ 醒来后重试整个流程
 ```
@@ -892,7 +892,100 @@ grep -n "queueSEMAPHORE_QUEUE_ITEM_LENGTH" queue.c
 grep -n "semSEMAPHORE_QUEUE_ITEM_LENGTH"   include/semphr.h
 ```
 
-## 7.4 一句话总结
+## 7.4 注释级精读：阻塞、超时与两条唤醒路径的链表协作
+
+队列的阻塞不是“在 queue.c 里睡下”，而是 queue.c 把任务交给 tasks.c 的
+延时表/事件表；理解这一点才能读懂 `xQueueReceive()` 的返回值和
+`xTaskIncrementTick()` 的摘链动作。
+
+### 7.4.1 任务进入阻塞的两步
+
+`xQueueReceive()` 在队列为空且允许等待时，执行顺序是：
+
+1. `vTaskPlaceOnEventList( &( pxQueue->xTasksWaitingToReceive ), xTicksToWait )`
+   （queue.c:1589）：
+   - 把 `pxCurrentTCB->xEventListItem` 插入队列的等待接收链表；
+   - 该链表按 `xEventListItem.xItemValue` 排序，值是
+     `configMAX_PRIORITIES - uxPriority`（tasks.c:2067）；
+   - 继续调用 `prvAddCurrentTaskToDelayedList()`（tasks.c:5750），
+     把 `xStateListItem` 插入延时表，排序键是绝对唤醒 tick。
+2. 调用 `xTaskResumeAll()`（queue.c:1592），必要时 `taskYIELD_WITHIN_API()`
+   （queue.c:1594），让调度器切换到其他任务。
+
+此刻同一个 TCB 同时挂在两条链表上：
+
+```text
+xStateListItem  →  pxDelayedTaskList（或 overflow），等超时
+xEventListItem  →  queue->xTasksWaitingToReceive，等数据
+```
+
+### 7.4.2 两条唤醒路径
+
+| 路径 | 触发 | 关键函数 | 链表动作 |
+|---|---|---|---|
+| 事件先到 | 另一任务/ISR 发送数据 | `xTaskRemoveFromEventList()`（tasks.c:5831） | 从事件表摘 `xEventListItem`；若任务在延时表，摘 `xStateListItem`；加入就绪表或 `xPendingReadyList` |
+| 超时先到 | tick 到期 | `xTaskIncrementTick()`（tasks.c:5139） | 从延时表摘 `xStateListItem`；若 `xEventListItem.pxContainer != NULL`，一并摘除；加入就绪表 |
+
+两条路径都遵循“先摘除另一个等待源，再加入就绪表”的顺序，保证任务不会
+同时留在两条链表上。区别是：
+
+- 事件路径由 `xTaskRemoveFromEventList()` 负责；
+- 超时路径由 `xTaskIncrementTick()` 的 tasks.c:5228-5231 负责。
+
+### 7.4.3 为什么超时路径必须检查 `xEventListItem`
+
+tasks.c:5228：
+
+```c
+if( listLIST_ITEM_CONTAINER( &( pxTCB->xEventListItem ) ) != NULL )
+{
+    listREMOVE_ITEM( &( pxTCB->xEventListItem ) );
+}
+```
+
+`xEventListItem` 在任务创建时被 `vListInitialiseItem()` 初始化，
+`pxContainer` 为 `NULL`。只有任务调用 `vTaskPlaceOnEventList()` 后，
+它才被插入队列等待链表，`pxContainer` 变为该链表指针。
+
+如果任务因超时被唤醒却不摘除事件项：
+
+1. 事件链表仍包含该 TCB；
+2. 之后队列发送数据时，`xTaskRemoveFromEventList()` 会再次把同一 TCB
+   从“事件表”摘除并加入就绪表；
+3. 任务可能已经重新阻塞在另一个事件上，旧的等待项会破坏新状态，
+   造成重复唤醒、链表计数错误或断言失败。
+
+因此“超时先到就取消事件等待”不是优化，而是链表成员资格的一致性要求。
+
+### 7.4.4 返回值与超时的关系
+
+`xQueueReceive()` 在 queue.c:1618-1623 判断：
+
+```c
+if( prvIsQueueEmpty( pxQueue ) != pdFALSE )
+{
+    return errQUEUE_EMPTY;
+}
+```
+
+- 超时后队列仍空 → 返回 `errQUEUE_EMPTY`；
+- 超时检查前队列已有数据 → 回到循环继续读，返回 `pdPASS`；
+- 事件路径先唤醒 → `xTaskRemoveFromEventList()` 已把任务移出延时表，
+  任务恢复后重新检查队列，通常能读到数据。
+
+`xQueueReceive()` 的返回值不是“是否发生过超时”的绝对记录，而是
+“本次调用结束时是否取到了数据”。即使等待过程中超时，只要在超时检查
+与返回之间数据到达，仍可能返回 `pdPASS`。
+
+### 7.4.5 校验清单
+
+1. 阻塞前是否同时挂上 `xEventListItem` 和 `xStateListItem`？
+2. 超时路径是否检查并摘除 `xEventListItem`？
+3. 事件路径是否检查并摘除 `xStateListItem`？
+4. 摘除后是否加入就绪表，或在调度器挂起时加入 `xPendingReadyList`？
+5. 返回值反映的是“数据是否取到”，还是“是否发生过超时”？
+
+## 7.5 一句话总结
 
 - **一个结构 `Queue_t`、一套代码，实现了队列 + 4 种同步原语**。
   区分靠两个字段：`uxItemSize`（0 = 信号量）、`uxQueueType`（NULL = 互斥量）。
